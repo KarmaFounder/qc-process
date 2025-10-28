@@ -1,0 +1,21 @@
+{
+  "name": "qc-process",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "convex dev",
+    "deploy": "convex deploy",
+    "format": "prettier -w .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "convex": "^1.28.0",
+    "monday-sdk-js": "^0.5.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  }
+}
