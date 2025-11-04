@@ -16,12 +16,18 @@ const CFG = {
   JOB_BAG_OWNER_COLUMN_ID: process.env.MONDAY_JOB_BAG_OWNER_COLUMN_ID || "person", // set exact id via env
   BRIEFED_BY_COLUMN_ID: process.env.MONDAY_BRIEFED_BY_COLUMN_ID || undefined, // parent item people column to mirror assignee
   TEST_GROUP_ID: process.env.MONDAY_TEST_GROUP_ID || "group_mktsne0w",
+  TASK_TYPE_COLUMN_ID: process.env.MONDAY_TASK_TYPE_COLUMN_ID || undefined, // e.g. a Status/Text column titled "Task Type"
 
   // Labels / indices
   INTERNAL_REVIEW_LABEL: process.env.MONDAY_INTERNAL_REVIEW_LABEL || "Internal Review",
   INTERNAL_REVIEW_INDEX: numOrUndef(process.env.MONDAY_INTERNAL_REVIEW_INDEX) ?? 7,
   INT_REVERTS_LABEL: process.env.MONDAY_INT_REVERTS_LABEL || "6. Int. Reverts",
   INT_REVERTS_INDEX: numOrUndef(process.env.MONDAY_INT_REVERTS_INDEX) ?? 8,
+
+  READY_TO_SEND_LABEL: process.env.MONDAY_READY_TO_SEND_LABEL || process.env.MONDAY_ALL_PASS_STAGE_LABEL || "Ready to Send",
+  READY_TO_SEND_INDEX: numOrUndef(process.env.MONDAY_READY_TO_SEND_INDEX) ?? numOrUndef(process.env.MONDAY_ALL_PASS_STAGE_INDEX),
+  COMPLETED_LABEL: process.env.MONDAY_COMPLETED_LABEL || "Completed",
+  COMPLETED_INDEX: numOrUndef(process.env.MONDAY_COMPLETED_INDEX),
 
   STATUS_IN_REVIEW_LABEL: process.env.MONDAY_STATUS_IN_REVIEW_LABEL || "In Review",
   STATUS_PASS_LABEL: process.env.MONDAY_STATUS_PASS_LABEL || "Pass",
@@ -35,6 +41,9 @@ const CFG = {
   PERSON_CHRISTINE: Number(process.env.MONDAY_PERSON_CHRISTINE || 77673213),
   PERSON_CAROLINE: Number(process.env.MONDAY_PERSON_CAROLINE || 70707376),
   PERSON_LUSANDA: Number(process.env.MONDAY_PERSON_LUSANDA || 77846388),
+
+  // Task types to apply this flow to (normalize/compare lowercased)
+  TASK_TYPES_ALLOWED_CSV: process.env.MONDAY_TASK_TYPES_ALLOWED_CSV || "creative,animation,presentation,editing,copy",
 };
 
 const http = httpRouter();
@@ -88,7 +97,8 @@ http.route({
     const QC3 = (cols.qc3Id ?? CFG.QC3_COLUMN_ID) as string;
     const CURRENTLY_WITH = (cols.currentlyWithId ?? CFG.CURRENTLY_WITH_COLUMN_ID) as string;
     const AIQC = (cols.aiQcId ?? CFG.AI_QC_COLUMN_ID) as string | undefined;
-    console.log("qc:columns:resolved", { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC });
+    const TASK_TYPE = (cols.taskTypeId ?? CFG.TASK_TYPE_COLUMN_ID) as string | undefined;
+    console.log("qc:columns:resolved", { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC, TASK_TYPE });
 
     // Only react to Task Stage, QC1, QC2, QC3 columns
     if (![TASK_STAGE, QC1, QC2, QC3].includes(columnId)) {
@@ -106,21 +116,59 @@ http.route({
     console.log("qc:webhook:diagnostic", JSON.stringify({ isTaskStage, isQc1, isQc2, isQc3, matchesInternal }));
 
     try {
+      // Determine task type and scope once
+      let typeNormGlobal: string | undefined;
+      try {
+        const item = await fetchItemWithParentAndColumns(itemId);
+        const t = TASK_TYPE ? getColumnText(item, TASK_TYPE) : undefined;
+        typeNormGlobal = normalize(t);
+      } catch {}
+      const allowedSet = String(CFG.TASK_TYPES_ALLOWED_CSV || "").split(/[,\s]+/).map(normalize).filter(Boolean);
+      const isCopyGlobal = typeNormGlobal === "copy";
+      const inScope = !TASK_TYPE || (allowedSet.includes(typeNormGlobal || ""));
+
+      if (!inScope) {
+        console.log("qc:skip:out_of_scope_task_type", { itemId, typeNormGlobal, allowedSet });
+        return textResponse("Ignored", 200);
+      }
+
+      // 0) When Task Stage becomes Completed -> reset all QC columns and clear Currently With
+      if (isTaskStage && (
+        matchesLabel(labelText, labelIndex, CFG.COMPLETED_LABEL, CFG.COMPLETED_INDEX) ||
+        containsNormalized(labelText, "completed")
+      )) {
+        console.log("qc:completed:trigger", { itemId, columnId, labelText, labelIndex });
+        await resetStatuses(boardId, itemId, [QC1, QC2, QC3]);
+        await setMondayPeople(boardId, itemId, CURRENTLY_WITH, []);
+        return textResponse("OK", 200);
+      }
+
       // 1) When Task Stage becomes Internal Review -> start all QC in Review and assign full team
       if (isTaskStage && (
         matchesLabel(labelText, labelIndex, CFG.INTERNAL_REVIEW_LABEL, CFG.INTERNAL_REVIEW_INDEX) ||
         containsNormalized(labelText, "internal review")
       )) {
         console.log("qc:internal:trigger", { itemId, columnId, labelText, labelIndex });
-        await logColumnsSnapshot(itemId, { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC });
+        await logColumnsSnapshot(itemId, { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC, TASK_TYPE });
 
-        await ensureStatus(boardId, itemId, QC1, CFG.STATUS_IN_REVIEW_LABEL);
-        await ensureStatus(boardId, itemId, QC2, CFG.STATUS_IN_REVIEW_LABEL);
-        await ensureStatus(boardId, itemId, QC3, CFG.STATUS_IN_REVIEW_LABEL);
+        // Copy vs normal for Internal Review
+        const isCopy = (typeNormGlobal === "copy");
 
-        await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
+        if (isCopy) {
+          // Copy tasks: leave QC1 & QC2 blank, set QC3 to In Review, CW = Briefed By only
+          await resetStatuses(boardId, itemId, [QC1, QC2]);
+          await ensureStatus(boardId, itemId, QC3, CFG.STATUS_IN_REVIEW_LABEL);
+          const briefed = await resolveParentPeopleByColumn(itemId, CFG.BRIEFED_BY_COLUMN_ID);
+          await ensurePeople(boardId, itemId, CURRENTLY_WITH, briefed);
+        } else {
+          // Normal process for other task types
+          await ensureStatus(boardId, itemId, QC1, CFG.STATUS_IN_REVIEW_LABEL);
+          await ensureStatus(boardId, itemId, QC2, CFG.STATUS_IN_REVIEW_LABEL);
+          await ensureStatus(boardId, itemId, QC3, CFG.STATUS_IN_REVIEW_LABEL);
+          await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
+        }
 
-        await logColumnsSnapshot(itemId, { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC });
+        await logColumnsSnapshot(itemId, { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC, TASK_TYPE });
         return textResponse("OK", 200);
       }
 
@@ -130,14 +178,14 @@ http.route({
           // Q1 Pass: only remove copywriters from Currently With; do not change any QC statuses
           console.log("flow:qc1:pass", { itemId, labelIndex });
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
         if (matchesLabel(labelText, labelIndex, CFG.STATUS_REVERTS_LABEL) || isRevertsLabel(labelText)) {
           // Q1 Reverts: only remove copywriters; do not change QC2/QC3 statuses
           console.log("flow:qc1:reverts", { itemId, labelIndex });
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
       }
@@ -148,14 +196,14 @@ http.route({
           // QC2 Pass: only remove Christine; do not change QC3
           console.log("flow:qc2:pass", { itemId, labelIndex });
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
         if (matchesLabel(labelText, labelIndex, CFG.STATUS_REVERTS_LABEL) || isRevertsLabel(labelText)) {
           // QC2 Reverts: only remove Christine; do not change other QC columns
           console.log("flow:qc2:reverts", { itemId, labelIndex });
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
       }
@@ -168,7 +216,7 @@ http.route({
           const briefed = await resolveParentPeopleByColumn(itemId, CFG.BRIEFED_BY_COLUMN_ID);
           if (briefed.length) await removePeopleFromCurrentlyWith(boardId, itemId, CURRENTLY_WITH, briefed);
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
         if (matchesLabel(labelText, labelIndex, CFG.STATUS_PASS_LABEL) || isPassLabel(labelText)) {
@@ -177,7 +225,7 @@ http.route({
           const briefed = await resolveParentPeopleByColumn(itemId, CFG.BRIEFED_BY_COLUMN_ID);
           if (briefed.length) await removePeopleFromCurrentlyWith(boardId, itemId, CURRENTLY_WITH, briefed);
           await recomputeCurrentlyWith(boardId, itemId, CURRENTLY_WITH, QC1, QC2, QC3);
-          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3);
+          await evaluateAndUpdateStage(boardId, itemId, TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, TASK_TYPE);
           return textResponse("OK", 200);
         }
       }
@@ -328,6 +376,7 @@ type ResolvedColumns = {
   qc3Id?: string;
   currentlyWithId?: string;
   aiQcId?: string;
+  taskTypeId?: string;
 };
 async function resolveBoardColumns(boardId: number): Promise<ResolvedColumns> {
   try {
@@ -365,6 +414,7 @@ async function resolveBoardColumns(boardId: number): Promise<ResolvedColumns> {
       qc3Id: findByTitle("QC 3 - CS"),
       currentlyWithId: findByTitle("Currently With"),
       aiQcId: findByTitle("AI QC") || findStatusByLabel("AI QC"),
+      taskTypeId: findByTitle("Task Type") || CFG.TASK_TYPE_COLUMN_ID,
     };
   } catch (e: any) {
     console.log("columns:resolve:error", { message: e?.message });
@@ -413,12 +463,14 @@ async function resetStatuses(boardId: number, itemId: number, columnIds: string[
   }
 }
 
-async function evaluateAndUpdateStage(boardId: number, itemId: number, TASK_STAGE: string, QC1: string, QC2: string, QC3: string) {
+async function evaluateAndUpdateStage(boardId: number, itemId: number, TASK_STAGE: string, QC1: string, QC2: string, QC3: string, CURRENTLY_WITH?: string, TASK_TYPE?: string) {
   try {
     const item = await fetchItemWithParentAndColumns(itemId);
     const s1 = getColumnText(item, QC1);
     const s2 = getColumnText(item, QC2);
     const s3 = getColumnText(item, QC3);
+    const typeText = TASK_TYPE ? getColumnText(item, TASK_TYPE) : undefined;
+    const typeNorm = normalize(typeText);
 
     const inRev1 = containsNormalized(s1, "in review");
     const inRev2 = containsNormalized(s2, "in review");
@@ -428,24 +480,30 @@ async function evaluateAndUpdateStage(boardId: number, itemId: number, TASK_STAG
     const rev2 = isRevertsLabel(s2);
     const rev3 = isRevertsLabel(s3);
 
-    const allPass = isPassLabel(s1) && isPassLabel(s2) && isPassLabel(s3);
-    const allReverts = rev1 && rev2 && rev3;
-    const notAllInReview = !(inRev1 && inRev2 && inRev3);
+    const allPass = (typeNorm === "copy")
+      ? isPassLabel(s3)
+      : (isPassLabel(s1) && isPassLabel(s2) && isPassLabel(s3));
+    const noneInReview = !inRev1 && !inRev2 && !inRev3;
     const anyReverts = rev1 || rev2 || rev3;
 
-    console.log("qc:aggregate", { s1, s2, s3, inRev1, inRev2, inRev3, allPass, allReverts, notAllInReview, anyReverts });
+    console.log("qc:aggregate", { s1, s2, s3, inRev1, inRev2, inRev3, allPass, noneInReview, anyReverts });
 
-    if (allReverts || (notAllInReview && anyReverts)) {
+    if (noneInReview && anyReverts) {
       // Move to Internal Reverts using label (avoid index mismatches)
       await ensureStatus(boardId, itemId, TASK_STAGE, CFG.INT_REVERTS_LABEL);
       return;
     }
 
     if (allPass) {
-      const label = process.env.MONDAY_ALL_PASS_STAGE_LABEL;
-      const idx = numOrUndef(process.env.MONDAY_ALL_PASS_STAGE_INDEX);
+      // Set stage to Ready to Send and set Currently With to only Briefed By
+      const label = CFG.READY_TO_SEND_LABEL;
+      const idx = CFG.READY_TO_SEND_INDEX;
       if (label || typeof idx === "number") {
         await ensureStatus(boardId, itemId, TASK_STAGE, label || "", idx);
+      }
+      if (CURRENTLY_WITH) {
+        const briefed = await resolveParentPeopleByColumn(itemId, CFG.BRIEFED_BY_COLUMN_ID);
+        await ensurePeople(boardId, itemId, CURRENTLY_WITH, briefed);
       }
     }
   } catch (e: any) {
