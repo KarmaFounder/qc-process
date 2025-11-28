@@ -16,8 +16,15 @@ Workflow
 - When QC 2 -> Pass:
   - Set QC 3 - CS to “In Review”
   - Assign Currently With: Job bag owner (parent item owner)
-- Failure at any QC stage (Reverts):
-  - Set Task Stage to “6. Int. Reverts”
+- When any QC changes to Pass/Reverts:
+  - IF all QC columns are NOT "In Review"
+  - AND any QC column is "Reverts"
+  - AND Task Stage is "Internal Review"
+  - THEN:
+    - Set Task Stage to "6. Int. Reverts"
+    - Post update mentioning "Briefed By" person(s) to update Internal Deadline
+- When all QC Pass:
+  - Set Task Stage to "Ready to Send"
 
 Setup
 1) Install deps
@@ -66,6 +73,9 @@ npx convex env set MONDAY_PERSON_LUSANDA 77846388
 
 # Job bag owner column on parent item
 npx convex env set MONDAY_JOB_BAG_OWNER_COLUMN_ID {{OWNER_COLUMN_ID}}
+
+# Notification message when transitioning to Internal Reverts (optional)
+npx convex env set MONDAY_REVERTS_NOTIFICATION_MESSAGE "This item has moved to Internal Reverts. Please update the Internal Deadline accordingly."
 ```
 
 4) Deploy when ready

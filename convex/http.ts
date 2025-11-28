@@ -12,6 +12,8 @@ const CFG = {
   QC2_COLUMN_ID: process.env.MONDAY_QC2_COLUMN_ID || "color_mkx4wfdz",
   QC3_COLUMN_ID: process.env.MONDAY_QC3_COLUMN_ID || "color_mkx4rwcm",
   CURRENTLY_WITH_COLUMN_ID: process.env.MONDAY_CURRENTLY_WITH_COLUMN_ID || "multiple_person_mkwzxjqy",
+  CLIENT_DEADLINE_COLUMN_ID: process.env.MONDAY_CLIENT_DEADLINE_COLUMN_ID || undefined,
+  INTERNAL_DEADLINE_COLUMN_ID: process.env.MONDAY_INTERNAL_DEADLINE_COLUMN_ID || undefined,
   AI_QC_COLUMN_ID: process.env.MONDAY_AI_QC_COLUMN_ID || undefined, // set this via env
   JOB_BAG_OWNER_COLUMN_ID: process.env.MONDAY_JOB_BAG_OWNER_COLUMN_ID || "person", // set exact id via env
   BRIEFED_BY_COLUMN_ID: process.env.MONDAY_BRIEFED_BY_COLUMN_ID || undefined, // parent item people column to mirror assignee
@@ -44,6 +46,9 @@ const CFG = {
 
   // Task types to apply this flow to (normalize/compare lowercased)
   TASK_TYPES_ALLOWED_CSV: process.env.MONDAY_TASK_TYPES_ALLOWED_CSV || "creative,animation,presentation,editing,copy",
+
+  // Notification message when transitioning to Internal Reverts
+  REVERTS_NOTIFICATION_MESSAGE: process.env.MONDAY_REVERTS_NOTIFICATION_MESSAGE || "This item has moved to Internal Reverts. Please update the Internal Deadline accordingly.",
 };
 
 const http = httpRouter();
@@ -98,9 +103,26 @@ http.route({
     const CURRENTLY_WITH = (cols.currentlyWithId ?? CFG.CURRENTLY_WITH_COLUMN_ID) as string;
     const AIQC = (cols.aiQcId ?? CFG.AI_QC_COLUMN_ID) as string | undefined;
     const TASK_TYPE = (cols.taskTypeId ?? CFG.TASK_TYPE_COLUMN_ID) as string | undefined;
-    console.log("qc:columns:resolved", { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC, TASK_TYPE });
+    const CLIENT_DEADLINE = (cols.clientDeadlineId ?? CFG.CLIENT_DEADLINE_COLUMN_ID) as string | undefined;
+    const INTERNAL_DEADLINE = (cols.internalDeadlineId ?? CFG.INTERNAL_DEADLINE_COLUMN_ID) as string | undefined;
+    console.log("qc:columns:resolved", { TASK_STAGE, QC1, QC2, QC3, CURRENTLY_WITH, AIQC, TASK_TYPE, CLIENT_DEADLINE, INTERNAL_DEADLINE });
 
-    // Only react to Task Stage, QC1, QC2, QC3 columns
+    // 0) When Client Deadline changes -> update Internal Deadline to 1 working day (24h) before
+    if (CLIENT_DEADLINE && columnId === CLIENT_DEADLINE) {
+      console.log("deadline:webhook:client_deadline_changed", { itemId, boardId, columnId });
+      if (!INTERNAL_DEADLINE) {
+        console.log("deadline:webhook:no_internal_deadline_column", { itemId, boardId });
+        return textResponse("OK", 200);
+      }
+      try {
+        await syncInternalDeadline(boardId, itemId, CLIENT_DEADLINE, INTERNAL_DEADLINE);
+      } catch (e: any) {
+        console.log("deadline:webhook:error", { message: e?.message });
+      }
+      return textResponse("OK", 200);
+    }
+
+    // Only react to Task Stage, QC1, QC2, QC3 columns for QC logic
     if (![TASK_STAGE, QC1, QC2, QC3].includes(columnId)) {
       console.log("qc:webhook:skip:notTarget", { columnId });
       return textResponse("Ignored", 200);
@@ -122,7 +144,7 @@ http.route({
         const item = await fetchItemWithParentAndColumns(itemId);
         const t = TASK_TYPE ? getColumnText(item, TASK_TYPE) : undefined;
         typeNormGlobal = normalize(t);
-      } catch {}
+      } catch { }
       const allowedSet = String(CFG.TASK_TYPES_ALLOWED_CSV || "").split(/[,\s]+/).map(normalize).filter(Boolean);
       const isCopyGlobal = typeNormGlobal === "copy";
       const inScope = !TASK_TYPE || (allowedSet.includes(typeNormGlobal || ""));
@@ -132,12 +154,12 @@ http.route({
         return textResponse("Ignored", 200);
       }
 
-      // 0) When Task Stage becomes Completed -> reset all QC columns and clear Currently With
+      // 0) When Task Stage becomes Internal Reverts -> reset all QC columns and clear Currently With
       if (isTaskStage && (
-        matchesLabel(labelText, labelIndex, CFG.COMPLETED_LABEL, CFG.COMPLETED_INDEX) ||
-        containsNormalized(labelText, "completed")
+        matchesLabel(labelText, labelIndex, CFG.INT_REVERTS_LABEL, CFG.INT_REVERTS_INDEX) ||
+        containsNormalized(labelText, CFG.INT_REVERTS_LABEL || "6. Int. Reverts")
       )) {
-        console.log("qc:completed:trigger", { itemId, columnId, labelText, labelIndex });
+        console.log("qc:int_reverts:trigger", { itemId, columnId, labelText, labelIndex });
         await resetStatuses(boardId, itemId, [QC1, QC2, QC3]);
         await setMondayPeople(boardId, itemId, CURRENTLY_WITH, []);
         return textResponse("OK", 200);
@@ -256,7 +278,7 @@ async function safeJson(req: Request): Promise<any> {
       const url = new URL(req.url);
       const ch = url.searchParams.get("challenge");
       if (ch) return { challenge: ch };
-    } catch {}
+    } catch { }
     return null;
   }
 }
@@ -285,7 +307,7 @@ async function resolveAiQcColumnId(boardId: number): Promise<string | undefined>
         if (String(c?.type).includes("color") && values.find((v: any) => String(v).toLowerCase() === "ai qc")) {
           return String(c.id);
         }
-      } catch {}
+      } catch { }
     }
     // Fallback: column title is "AI QC"
     const byTitle = cols.find((c: any) => String(c?.title || "").toLowerCase() === "ai qc");
@@ -369,6 +391,61 @@ async function logColumnsSnapshot(itemId: number, ids: { [k: string]: string | u
   }
 }
 
+async function syncInternalDeadline(boardId: number, itemId: number, clientColumnId: string, internalColumnId: string) {
+  const item = await fetchItemWithParentAndColumns(itemId);
+  const payload = getDateColumnPayload(item, clientColumnId);
+  if (!payload) {
+    console.log("deadline:sync:skip:no_client_date", { itemId, clientColumnId });
+    return;
+  }
+  const internalDate = shiftDateByDays(payload.date, -1);
+  if (!internalDate) {
+    console.log("deadline:sync:skip:cant_shift_date", { itemId, clientColumnId, date: payload.date });
+    return;
+  }
+  const next: any = { date: internalDate };
+  if (payload.time) next.time = payload.time;
+  if (payload.timezone) next.timezone = payload.timezone;
+  console.log("deadline:sync", { itemId, boardId, clientColumnId, internalColumnId, clientDate: payload.date, internalDate });
+  await setMondayColumnValue(boardId, itemId, internalColumnId, JSON.stringify(next));
+}
+function getDateColumnPayload(item: any, columnId: string): { raw: any; date: string; time?: string; timezone?: string } | undefined {
+  try {
+    const cv = getColumn(item, columnId);
+    if (!cv) return undefined;
+    let raw: any = undefined;
+    try {
+      raw = typeof cv.value === "string" ? JSON.parse(cv.value) : cv.value;
+    } catch {
+      raw = cv.value;
+    }
+    const text: string = typeof cv.text === "string" ? cv.text : "";
+    const fromRaw = raw?.date as string | undefined;
+    const fromText = text ? String(text).split(" ")[0] : undefined;
+    const date = fromRaw || fromText;
+    if (!date) return undefined;
+    return { raw, date, time: raw?.time as string | undefined, timezone: raw?.timezone as string | undefined };
+  } catch {
+    return undefined;
+  }
+}
+function shiftDateByDays(dateStr: string, offsetDays: number): string | undefined {
+  try {
+    const parts = dateStr.split("-").map((p) => Number(p));
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return undefined;
+    const [y, m, d] = parts;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (Number.isNaN(dt.getTime())) return undefined;
+    dt.setUTCDate(dt.getUTCDate() + offsetDays);
+    const yy = dt.getUTCFullYear();
+    const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(dt.getUTCDate()).padStart(2, "0");
+    return `${yy}-${mm}-${dd}`;
+  } catch {
+    return undefined;
+  }
+}
+
 type ResolvedColumns = {
   taskStageId?: string;
   qc1Id?: string;
@@ -377,6 +454,8 @@ type ResolvedColumns = {
   currentlyWithId?: string;
   aiQcId?: string;
   taskTypeId?: string;
+  clientDeadlineId?: string;
+  internalDeadlineId?: string;
 };
 async function resolveBoardColumns(boardId: number): Promise<ResolvedColumns> {
   try {
@@ -403,7 +482,7 @@ async function resolveBoardColumns(boardId: number): Promise<ResolvedColumns> {
           if (String(c?.type).includes("color") && values.find((v: any) => normalize(String(v)) === normalize(label))) {
             return String(c.id);
           }
-        } catch {}
+        } catch { }
       }
       return undefined;
     };
@@ -415,6 +494,8 @@ async function resolveBoardColumns(boardId: number): Promise<ResolvedColumns> {
       currentlyWithId: findByTitle("Currently With"),
       aiQcId: findByTitle("AI QC") || findStatusByLabel("AI QC"),
       taskTypeId: findByTitle("Task Type") || CFG.TASK_TYPE_COLUMN_ID,
+      clientDeadlineId: findByTitle("Client Deadline"),
+      internalDeadlineId: findByTitle("Internal Deadline"),
     };
   } catch (e: any) {
     console.log("columns:resolve:error", { message: e?.message });
@@ -463,6 +544,28 @@ async function resetStatuses(boardId: number, itemId: number, columnIds: string[
   }
 }
 
+async function createMondayUpdate(itemId: number, message: string, mentionPersonIds?: number[]) {
+  console.log("monday:createUpdate", { itemId, message: preview(message), mentionPersonIds });
+
+  // Build the update body with mentions if provided
+  let body = message;
+  if (mentionPersonIds && mentionPersonIds.length > 0) {
+    const mentions = mentionPersonIds.map((id) => `@[${id}]`).join(" ");
+    body = `${mentions} ${message}`;
+  }
+
+  const m = `
+    mutation ($itemId: ID!, $body: String!) {
+      create_update(item_id: $itemId, body: $body) { id }
+    }
+  `;
+
+  const r = await mondayApi(m, { itemId: String(itemId), body });
+  console.log("monday:createUpdate:ok", { itemId });
+  return r;
+}
+
+
 async function evaluateAndUpdateStage(boardId: number, itemId: number, TASK_STAGE: string, QC1: string, QC2: string, QC3: string, CURRENTLY_WITH?: string, TASK_TYPE?: string) {
   try {
     const item = await fetchItemWithParentAndColumns(itemId);
@@ -489,8 +592,29 @@ async function evaluateAndUpdateStage(boardId: number, itemId: number, TASK_STAG
     console.log("qc:aggregate", { s1, s2, s3, inRev1, inRev2, inRev3, allPass, noneInReview, anyReverts });
 
     if (noneInReview && anyReverts) {
-      // Move to Internal Reverts using label (avoid index mismatches)
-      await ensureStatus(boardId, itemId, TASK_STAGE, CFG.INT_REVERTS_LABEL);
+      // Check if current Task Stage is "Internal Review" before transitioning
+      const currentStage = getColumnText(item, TASK_STAGE);
+      const isInternalReview = containsNormalized(currentStage, "internal review");
+
+      console.log("qc:reverts:check", { currentStage, isInternalReview, noneInReview, anyReverts });
+
+      if (isInternalReview) {
+        // Move to Internal Reverts using label (avoid index mismatches)
+        await ensureStatus(boardId, itemId, TASK_STAGE, CFG.INT_REVERTS_LABEL);
+
+        // Notify Briefed By person(s) to update Internal Deadline
+        try {
+          const briefed = await resolveParentPeopleByColumn(itemId, CFG.BRIEFED_BY_COLUMN_ID);
+          if (briefed.length > 0) {
+            await createMondayUpdate(itemId, CFG.REVERTS_NOTIFICATION_MESSAGE, briefed);
+            console.log("qc:reverts:notified", { itemId, briefedPeople: briefed });
+          }
+        } catch (e: any) {
+          console.log("qc:reverts:notify:error", { message: e?.message });
+        }
+      } else {
+        console.log("qc:reverts:skip:not_internal_review", { currentStage });
+      }
       return;
     }
 
